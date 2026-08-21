@@ -1,0 +1,23 @@
+[
+  {"id":"eval_001","type":"narration","expected_route":"2.5d_parallax","continuity":"pass"},
+  {"id":"eval_002","type":"static_display","expected_route":"2.5d_parallax","continuity":"pass"},
+  {"id":"eval_003","type":"dialogue_closeup","expected_route":"portrait_drive","continuity":"pass"},
+  {"id":"eval_004","type":"dialogue_closeup","expected_route":"portrait_drive","continuity":"outfit_mismatch"},
+  {"id":"eval_005","type":"light_action","expected_route":"i2v","continuity":"pass"},
+  {"id":"eval_006","type":"premium_action","expected_route":"premium_i2v","continuity":"prop_missing"},
+  {"id":"eval_007","type":"weather","expected_route":"t2v","continuity":"pass"},
+  {"id":"eval_008","type":"transition","expected_route":"t2v","continuity":"pass"},
+  {"id":"eval_009","type":"narration","expected_route":"2.5d_parallax","continuity":"time_jump"},
+  {"id":"eval_010","type":"dialogue_closeup","expected_route":"portrait_drive","continuity":"pass"},
+  {"id":"eval_011","type":"static_display","expected_route":"2.5d_parallax","continuity":"location_jump"},
+  {"id":"eval_012","type":"premium_action","expected_route":"premium_i2v","continuity":"pass"},
+  {"id":"eval_013","type":"establishing","expected_route":"t2v","continuity":"pass"},
+  {"id":"eval_014","type":"light_action","expected_route":"i2v","continuity":"pass"},
+  {"id":"eval_015","type":"dialogue_closeup","expected_route":"portrait_drive","continuity":"prop_missing"},
+  {"id":"eval_016","type":"premium_action","expected_route":"premium_i2v","continuity":"outfit_mismatch"},
+  {"id":"eval_017","type":"narration","expected_route":"2.5d_parallax","continuity":"pass"},
+  {"id":"eval_018","type":"transition","expected_route":"t2v","continuity":"time_jump"},
+  {"id":"eval_019","type":"light_action","expected_route":"i2v","continuity":"location_jump"},
+  {"id":"eval_020","type":"dialogue_closeup","expected_route":"portrait_drive","continuity":"pass"}
+]
+
