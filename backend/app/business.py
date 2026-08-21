@@ -15,6 +15,7 @@ from .domain import (
     GenerationRun,
     GenerationStatus,
     Membership,
+    MediaKind,
     Principal,
     Project,
     RetryClass,
@@ -252,9 +253,29 @@ class DeliveryService:
     PRESET = {"width": 1080, "height": 1920, "fps": 24, "video_codec": "h264", "audio_codec": "aac"}
 
     def build_manifest(self, project: Project, media_root: Path) -> DeliveryManifest:
+        final = next((item for item in reversed(project.media_artifacts) if item.kind == MediaKind.final_video), None)
+        if final:
+            return DeliveryManifest(
+                id=f"delivery_{uuid4().hex[:10]}", organization_id=project.organization_id,
+                project_id=project.id, status="assembled", assembled=True, preset=self.PRESET,
+                tracks=[DeliveryTrack(
+                    kind="final_video", uri=f"artifact://{final.id}", checksum_sha256=final.checksum_sha256,
+                    file_size=final.file_size, ready=True,
+                )],
+            )
         blockers: list[str] = []
         tracks: list[DeliveryTrack] = []
         for shot in sorted(project.shots, key=lambda item: item.order):
+            artifact = next((
+                item for item in reversed(project.media_artifacts)
+                if item.kind == MediaKind.video and item.shot_id == shot.id
+            ), None)
+            if artifact:
+                tracks.append(DeliveryTrack(
+                    kind="video", uri=f"artifact://{artifact.id}", checksum_sha256=artifact.checksum_sha256,
+                    file_size=artifact.file_size, ready=True,
+                ))
+                continue
             run = next((item for item in reversed(project.generation_runs) if item.shot_id == shot.id and item.status == GenerationStatus.completed), None)
             if run is None or not run.output_uri or run.output_uri.startswith("mock://"):
                 blockers.append(f"{shot.id}: missing completed local media")

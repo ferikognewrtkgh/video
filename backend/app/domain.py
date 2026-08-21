@@ -56,6 +56,21 @@ class RetryClass(str, Enum):
     manual_review = "manual_review"
 
 
+class MediaKind(str, Enum):
+    keyframe = "keyframe"
+    video = "video"
+    audio = "audio"
+    subtitle = "subtitle"
+    final_video = "final_video"
+
+
+class ArtifactReviewStatus(str, Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    not_required = "not_required"
+
+
 class ContinuityState(BaseModel):
     location: str
     emotion: str = "neutral"
@@ -182,6 +197,9 @@ class GenerationRun(BaseModel):
     retry_class: Optional[RetryClass] = None
     reconciled_at: Optional[str] = None
     updated_at: str = Field(default_factory=utc_now)
+    media_kind: MediaKind = MediaKind.video
+    candidate_id: Optional[str] = None
+    artifact_id: Optional[str] = None
 
 
 class MetricScores(BaseModel):
@@ -225,6 +243,7 @@ class CostEvent(BaseModel):
     category: str
     provider: str
     amount: float
+    run_id: Optional[str] = None
     created_at: str = Field(default_factory=utc_now)
 
 
@@ -349,6 +368,46 @@ class DeliveryManifest(BaseModel):
     created_at: str = Field(default_factory=utc_now)
 
 
+class MediaArtifact(BaseModel):
+    id: str
+    organization_id: str
+    project_id: str
+    shot_id: Optional[str] = None
+    kind: MediaKind
+    storage_path: str
+    mime_type: str
+    checksum_sha256: str
+    file_size: int = Field(ge=1)
+    source: str
+    provider: Optional[str] = None
+    provider_task_id: Optional[str] = None
+    review_status: ArtifactReviewStatus = ArtifactReviewStatus.not_required
+    measured: bool = False
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=utc_now)
+
+
+class SubtitleCue(BaseModel):
+    id: str
+    shot_id: str
+    index: int
+    start_sec: float = Field(ge=0)
+    end_sec: float = Field(gt=0)
+    text: str = Field(min_length=1)
+    speaker: Optional[str] = None
+
+
+class ProductionReadiness(BaseModel):
+    ready: bool
+    image_provider: str
+    video_provider: str
+    tts_provider: str
+    ffmpeg_available: bool
+    ffprobe_available: bool
+    missing: List[str] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+
 class Project(BaseModel):
     id: str
     name: str
@@ -380,6 +439,8 @@ class Project(BaseModel):
     comments: List[ReviewComment] = Field(default_factory=list)
     audit_logs: List[AuditLog] = Field(default_factory=list)
     delivery_manifests: List[DeliveryManifest] = Field(default_factory=list)
+    media_artifacts: List[MediaArtifact] = Field(default_factory=list)
+    subtitle_cues: List[SubtitleCue] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
 
@@ -483,6 +544,33 @@ class DependencyRequest(BaseModel):
 class StoryboardImportRequest(BaseModel):
     csv_text: str = Field(min_length=1)
     expected_project_version: int = Field(ge=1)
+
+
+class GenerateKeyframesRequest(BaseModel):
+    count: int = Field(default=3, ge=2, le=4)
+    model: Optional[str] = None
+    request_id: Optional[str] = Field(default=None, min_length=8, max_length=100)
+
+
+class ApproveKeyframeRequest(BaseModel):
+    artifact_id: Optional[str] = None
+    comment: str = Field(default="", max_length=1000)
+
+
+class GenerateSpeechRequest(BaseModel):
+    voice: Optional[str] = None
+    model: Optional[str] = None
+    text: Optional[str] = Field(default=None, max_length=3000)
+    request_id: Optional[str] = Field(default=None, min_length=8, max_length=100)
+
+
+class BuildSubtitlesRequest(BaseModel):
+    include_action_as_narration: bool = True
+
+
+class AssembleProjectRequest(BaseModel):
+    require_audio: bool = True
+    require_approved_keyframes: bool = True
 
 
 class SourceDocumentRequest(BaseModel):

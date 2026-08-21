@@ -12,6 +12,7 @@ from app.providers import (
     ProviderProtocolError,
     ProviderState,
     create_media_provider,
+    create_stage_provider,
 )
 
 
@@ -115,6 +116,59 @@ async def test_comfyui_compiles_copy_and_finds_nonstandard_output_node():
     assert workflow["text"]["inputs"]["text"] == "old"
 
 
+@pytest.mark.anyio
+async def test_comfyui_i2v_requires_and_consumes_explicit_reference_placeholder():
+    captured = {}
+    workflow = {
+        "positive": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}"}},
+        "negative": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{negative_prompt}}"}},
+        "reference": {"class_type": "LoadImageFromUrl", "inputs": {"url": "{{reference_uri}}"}},
+    }
+
+    def handler(req: httpx.Request):
+        captured.update(json.loads(req.content)["prompt"])
+        return httpx.Response(200, json={"prompt_id": "i2v-1"})
+
+    provider = ComfyUIProvider("https://comfy.test", workflow, httpx.MockTransport(handler))
+    media_request = MediaRequest(
+        prompt="hero", model="i2v", idempotency_key="key", parameters={"negative_prompt": "flicker"},
+        reference_uri="https://studio.test/keyframe.png",
+    )
+    await provider.submit(media_request)
+    assert captured["positive"]["inputs"]["text"] == "hero"
+    assert captured["negative"]["inputs"]["text"] == "flicker"
+    assert captured["reference"]["inputs"]["url"] == "https://studio.test/keyframe.png"
+
+    unsafe = ComfyUIProvider("https://comfy.test", {"node": {"inputs": {"text": "old"}}})
+    with pytest.raises(ProviderProtocolError, match="reference_uri"):
+        await unsafe.submit(media_request)
+
+
+@pytest.mark.anyio
+async def test_comfyui_uploads_local_approved_keyframe_before_i2v_submit():
+    submitted = {}
+    workflow = {
+        "reference": {"class_type": "LoadImage", "inputs": {"image": "{{reference_uri}}"}},
+        "prompt": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}"}},
+    }
+
+    def handler(req: httpx.Request):
+        if req.url.path == "/upload/image":
+            assert b"approved.png" in req.content
+            assert b"real-image-bytes" in req.content
+            return httpx.Response(200, json={"name": "approved.png", "subfolder": "mangaflow", "type": "input"})
+        submitted.update(json.loads(req.content)["prompt"])
+        return httpx.Response(200, json={"prompt_id": "i2v-upload-1"})
+
+    provider = ComfyUIProvider("https://comfy.test", workflow, httpx.MockTransport(handler))
+    await provider.submit(MediaRequest(
+        prompt="hero", model="i2v", idempotency_key="key", parameters={},
+        reference_uri="artifact://approved", reference_content=b"real-image-bytes",
+        reference_filename="approved.png",
+    ))
+    assert submitted["reference"]["inputs"]["image"] == "mangaflow/approved.png"
+
+
 def test_provider_factory_validates_configuration():
     name, provider = create_media_provider({"MANGAFLOW_PROVIDER": "mock"})
     assert name == "mock" and provider is None
@@ -122,3 +176,19 @@ def test_provider_factory_validates_configuration():
         create_media_provider({"MANGAFLOW_PROVIDER": "cloud"})
     with pytest.raises(ValueError, match="Unsupported"):
         create_media_provider({"MANGAFLOW_PROVIDER": "unknown"})
+
+
+def test_auxiliary_provider_factory_never_silently_substitutes_mock():
+    name, provider = create_stage_provider("image", {})
+    assert name == "disabled" and provider is None
+    name, provider = create_stage_provider("tts", {
+        "MANGAFLOW_TTS_PROVIDER": "cloud-tts",
+        "TTS_PROVIDER_BASE_URL": "https://tts.test",
+        "TTS_PROVIDER_API_KEY": "secret",
+    })
+    assert name == "cloud-tts"
+    assert provider.capabilities().media_kinds == ("audio",)
+    with pytest.raises(ValueError, match="IMAGE_PROVIDER"):
+        create_stage_provider("image", {"MANGAFLOW_IMAGE_PROVIDER": "cloud-image"})
+    with pytest.raises(ValueError, match="Unsupported production stage"):
+        create_stage_provider("music", {})

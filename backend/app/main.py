@@ -5,11 +5,17 @@ import hmac
 import json
 import os
 import tempfile
+import asyncio
+import time
+from urllib.parse import urlparse
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+import httpx
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 
 from .adaptation import AdaptationAgent
 from .business import (
@@ -25,16 +31,25 @@ from .business import (
 )
 from .domain import (
     Approval,
+    ApproveKeyframeRequest,
+    ArtifactReviewStatus,
+    AssembleProjectRequest,
     Asset,
     AssetVersionRequest,
+    BuildSubtitlesRequest,
     CommentRequest,
     CostEvent,
     CreateProjectRequest,
     DependencyRequest,
+    DeliveryManifest,
+    DeliveryTrack,
     GenerationRun,
     GenerationStatus,
+    GenerateKeyframesRequest,
+    GenerateSpeechRequest,
     ImportProjectRequest,
     MediaInspectRequest,
+    MediaKind,
     Principal,
     Project,
     QAEvaluateRequest,
@@ -48,8 +63,18 @@ from .domain import (
     utc_now,
 )
 from .media_quality import MediaQualityAnalyzer
+from .media_pipeline import (
+    ArtifactFetcher,
+    ArtifactStore,
+    ArtifactValidationError,
+    AssemblyBlocked,
+    AssemblyFailed,
+    FFmpegAssembler,
+    MAX_BYTES,
+    SubtitleService,
+)
 from .ingestion import DocumentIngestionError, DocumentIngestor
-from .providers import MediaProvider, MediaRequest, ProviderState, create_media_provider
+from .providers import ComfyUIProvider, MediaProvider, MediaRequest, ProviderState, create_media_provider, create_stage_provider
 from .services import ContinuityEngine, MockProvider, PromptCompiler, QualityEngine, RenderRouter, WorkflowManager
 from .store import ProjectStore
 
@@ -62,6 +87,10 @@ def create_app(
     adaptation_agent: AdaptationAgent | None = None,
     identity_directory: IdentityDirectory | None = None,
     provider_override: tuple[str, MediaProvider | None] | None = None,
+    image_provider_override: tuple[str, MediaProvider | None] | None = None,
+    tts_provider_override: tuple[str, MediaProvider | None] | None = None,
+    artifact_fetcher_override: ArtifactFetcher | None = None,
+    assembler_override: FFmpegAssembler | None = None,
 ) -> FastAPI:
     env = environment or dict(os.environ)
     checkpoint_dir = checkpoint_dir or Path(env.get("MANGAFLOW_CHECKPOINT_DIR", str(Path(tempfile.gettempdir()) / "mangaflow-checkpoints")))
@@ -78,11 +107,33 @@ def create_app(
     dependencies = DependencyService()
     storyboard_exchange = StoryboardExchange()
     delivery_service = DeliveryService()
+    artifact_store = ArtifactStore(media_root)
+    subtitle_service = SubtitleService()
     document_ingestor = DocumentIngestor()
     identities = identity_directory or IdentityDirectory()
     agent = adaptation_agent or AdaptationAgent()
     comfy_workflow = _load_comfy_workflow(env.get("COMFYUI_WORKFLOW_PATH"))
+    comfy_image_workflow = _load_comfy_workflow(env.get("COMFYUI_IMAGE_WORKFLOW_PATH"))
     provider_name, remote_provider = provider_override or create_media_provider(env, comfy_workflow)
+    image_provider_name, image_provider = image_provider_override or create_stage_provider("image", env, comfy_image_workflow)
+    tts_provider_name, tts_provider = tts_provider_override or create_stage_provider("tts", env)
+    allowed_hosts = {
+        urlparse(value).hostname
+        for value in (
+            env.get("COMFYUI_BASE_URL"), env.get("CLOUD_VIDEO_BASE_URL"),
+            env.get("IMAGE_PROVIDER_BASE_URL"), env.get("TTS_PROVIDER_BASE_URL"),
+        )
+        if value and urlparse(value).hostname
+    }
+    allowed_hosts.update(item.strip() for item in env.get("MANGAFLOW_MEDIA_DOWNLOAD_HOSTS", "").split(",") if item.strip())
+    for provider in (remote_provider, image_provider, tts_provider):
+        base_url = getattr(provider, "base_url", None)
+        if base_url and urlparse(base_url).hostname:
+            allowed_hosts.add(urlparse(base_url).hostname)
+    artifact_fetcher = artifact_fetcher_override or ArtifactFetcher(allowed_hosts)
+    assembler = assembler_override or FFmpegAssembler(
+        env.get("FFMPEG_PATH", "ffmpeg"), env.get("FFPROBE_PATH", "ffprobe"),
+    )
     for project in store.restore_runs():
         mock_provider.restore(project.generation_runs)
 
@@ -96,6 +147,10 @@ def create_app(
     app.state.provider_name = provider_name
     app.state.media_root = media_root
     app.state.identities = identities
+    app.state.artifact_store = artifact_store
+    app.state.production_providers = {
+        "image": image_provider_name, "video": provider_name, "tts": tts_provider_name,
+    }
     auth_mode = env.get("MANGAFLOW_AUTH_MODE", "dev")
     identity_secret = env.get("MANGAFLOW_IDENTITY_HMAC_SECRET", "")
     if auth_mode == "strict" and not identity_secret:
@@ -125,12 +180,151 @@ def create_app(
         except AuthorizationError as exc:
             raise HTTPException(403, str(exc)) from exc
 
+    def provider_for_run(run: GenerationRun) -> MediaProvider | None:
+        if run.media_kind == MediaKind.keyframe:
+            return image_provider
+        if run.media_kind == MediaKind.audio:
+            return tts_provider
+        return remote_provider
+
+    async def submit_external_run(
+        project: Project,
+        shot,
+        principal: Principal,
+        kind: MediaKind,
+        provider_label: str,
+        provider: MediaProvider,
+        model: str,
+        prompt: str,
+        recipe_id: str,
+        parameters: dict,
+        reference_uri: str | None = None,
+        candidate_id: str | None = None,
+        reference_content: bytes | None = None,
+        reference_filename: str | None = None,
+    ) -> GenerationRun:
+        idempotency_key = hashlib.sha256(
+            f"{project.id}:{shot.id}:{kind.value}:{recipe_id}:{provider_label}:{model}:{candidate_id or ''}".encode()
+        ).hexdigest()
+        run = GenerationRun(
+            id=f"run_{uuid4().hex[:10]}", shot_id=shot.id, provider=provider_label,
+            provider_task_id=f"pending:{idempotency_key}", idempotency_key=idempotency_key,
+            status=GenerationStatus.queued, recipe_id=recipe_id, media_kind=kind,
+            candidate_id=candidate_id,
+        )
+        task_states.transition(run, TaskLifecycleStatus.submitting, f"Submitting {kind.value} task")
+        request = MediaRequest(
+            prompt=prompt, model=model, idempotency_key=idempotency_key,
+            parameters=parameters, reference_uri=reference_uri,
+            reference_content=reference_content, reference_filename=reference_filename,
+        )
+        try:
+            task = await provider.submit(request)
+        except Exception as exc:
+            normalized = provider.normalize_error(exc)
+            if normalized.outcome_unknown:
+                task_states.mark_unknown(run, exc)
+            else:
+                task_states.transition(run, TaskLifecycleStatus.failed, normalized.message)
+                run.error_code, run.error_message = normalized.code, normalized.message
+            project.generation_runs.append(run)
+            add_audit(project, principal, f"{kind.value}.submission_{run.lifecycle_status.value}", "run", run.id, error_code=normalized.code)
+            store.save(project)
+            if normalized.outcome_unknown:
+                return run
+            raise HTTPException(502, f"Provider submission failed: {normalized.message}") from exc
+        run.provider_task_id = task.id
+        task_states.transition(run, TaskLifecycleStatus.submitted, "Provider returned task id")
+        task_states.transition(run, _task_lifecycle(task.status), f"Provider state is {task.status.value}")
+        project.generation_runs.append(run)
+        add_audit(project, principal, f"{kind.value}.submitted", "run", run.id, provider=provider_label)
+        return run
+
+    async def materialize_provider_result(project: Project, run: GenerationRun, result_uri: str):
+        filename = f"{run.media_kind.value}-{run.provider_task_id}"
+        mime_type = None
+        if result_uri.startswith("file://"):
+            path = _safe_media_path(media_root, result_uri.removeprefix("file://"))
+            content = path.read_bytes()
+            filename = path.name
+        else:
+            downloaded = await artifact_fetcher.fetch(result_uri, run.media_kind)
+            content, filename, mime_type = downloaded.content, downloaded.filename, downloaded.mime_type
+        artifact = artifact_store.save_bytes(
+            project, run.media_kind, filename, content, run.shot_id, "provider",
+            provider=run.provider, provider_task_id=run.provider_task_id, mime_type=mime_type,
+            review_status=ArtifactReviewStatus.pending if run.media_kind == MediaKind.keyframe else ArtifactReviewStatus.not_required,
+            metadata={"remote_output_uri": result_uri, "candidate_id": run.candidate_id},
+        )
+        run.artifact_id = artifact.id
+        run.output_uri = f"artifact://{artifact.id}"
+        return attach_measurement(project, artifact)
+
+    def artifact_reference_uri(project: Project, artifact_id: str | None) -> str | None:
+        if not artifact_id:
+            return None
+        artifact = next((item for item in project.media_artifacts if item.id == artifact_id), None)
+        if artifact is None:
+            return None
+        provider_uri = artifact.metadata.get("provider_uri") or artifact.metadata.get("remote_output_uri")
+        if provider_uri:
+            return str(provider_uri)
+        public_base = env.get("MANGAFLOW_PUBLIC_MEDIA_BASE_URL", "").rstrip("/")
+        secret = env.get("MANGAFLOW_ARTIFACT_SIGNING_SECRET") or identity_secret
+        if not public_base or not secret:
+            return None
+        expires = int(time.time()) + 3600
+        token = hmac.new(secret.encode(), f"{artifact.id}:{expires}".encode(), hashlib.sha256).hexdigest()
+        return f"{public_base}/api/provider-assets/{artifact.id}?expires={expires}&token={token}"
+
+    def attach_measurement(project: Project, artifact):
+        if artifact.kind == MediaKind.video and artifact.shot_id:
+            shot = next((item for item in project.shots if item.id == artifact.shot_id), None)
+            if shot:
+                inspection = media_quality.inspect(artifact_store.path_for(artifact), shot.duration_sec)
+                artifact.metadata["inspection"] = inspection.model_dump()
+                artifact.measured = True
+        return artifact
+
     @app.get("/api/health")
     def health():
         return {
             "status": "ok", "service": "mangaflow-api", "provider": provider_name,
             "recovered_projects": len(list(store.restore_runs())), "version": app.version,
         }
+
+    @app.get("/api/production-readiness")
+    async def production_readiness(probe: bool = False, principal: Principal = Depends(current_principal)):
+        authorize(principal, "read")
+        readiness = assembler.preflight(image_provider_name, provider_name, tts_provider_name)
+        providers = {"image": image_provider, "video": remote_provider, "tts": tts_provider}
+        health = {name: None for name in providers}
+        if probe:
+            configured = [(name, provider) for name, provider in providers.items() if provider is not None]
+            results = await asyncio.gather(*(provider.health() for _, provider in configured), return_exceptions=True)
+            for (name, _), result in zip(configured, results):
+                health[name] = result is True
+        payload = readiness.model_dump()
+        payload["provider_health"] = health
+        payload["public_media_base_url_configured"] = bool(env.get("MANGAFLOW_PUBLIC_MEDIA_BASE_URL"))
+        return payload
+
+    @app.get("/api/provider-assets/{artifact_id}", include_in_schema=False)
+    def provider_artifact(artifact_id: str, expires: int, token: str):
+        secret = env.get("MANGAFLOW_ARTIFACT_SIGNING_SECRET") or identity_secret
+        if not secret or expires < int(time.time()):
+            raise HTTPException(403, "Artifact link is expired or signing is not configured")
+        expected = hmac.new(secret.encode(), f"{artifact_id}:{expires}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, token):
+            raise HTTPException(403, "Artifact link signature is invalid")
+        for project in store.list():
+            artifact = next((item for item in project.media_artifacts if item.id == artifact_id), None)
+            if artifact:
+                path = artifact_store.path_for(artifact)
+                if not path.is_file():
+                    raise HTTPException(404, "Artifact file not found")
+                return FileResponse(path, media_type=artifact.mime_type, filename=Path(artifact.storage_path).name)
+        raise HTTPException(404, "Artifact not found")
 
     @app.get("/api/projects")
     def list_projects(principal: Principal = Depends(current_principal)):
@@ -265,41 +459,34 @@ def create_app(
                 "estimated_cost": recipe.estimated_cost,
             })
         if remote_provider:
-            idempotency_key = hashlib.sha256(
-                f"{project.id}:{shot.id}:{recipe.id}:{provider_name}:{recipe.model}".encode()
-            ).hexdigest()
-            run = GenerationRun(
-                id=f"run_{uuid4().hex[:10]}", shot_id=shot.id, provider=provider_name,
-                provider_task_id=f"pending:{idempotency_key}", idempotency_key=idempotency_key,
-                status=GenerationStatus.queued, recipe_id=recipe.id,
+            reference_artifact = next((
+                item for item in project.media_artifacts if item.id == shot.first_frame_asset_id
+            ), None)
+            reference_uri = artifact_reference_uri(project, shot.first_frame_asset_id)
+            reference_content = None
+            reference_filename = None
+            if isinstance(remote_provider, ComfyUIProvider) and reference_artifact:
+                reference_path = artifact_store.path_for(reference_artifact)
+                reference_content = reference_path.read_bytes()
+                reference_filename = reference_path.name
+                reference_uri = reference_uri or f"artifact://{reference_artifact.id}"
+            if decision.route in {"i2v", "premium_i2v", "portrait_drive"}:
+                if not shot.first_frame_asset_id:
+                    raise HTTPException(409, "Real I2V requires an approved keyframe")
+                if not reference_uri:
+                    raise HTTPException(409, "Approved keyframe is not reachable by the Provider; configure a provider_uri or MANGAFLOW_PUBLIC_MEDIA_BASE_URL")
+            run = await submit_external_run(
+                project, shot, principal, MediaKind.video, provider_name, remote_provider,
+                recipe.model, recipe.prompt, recipe.id,
+                {**recipe.parameters, "negative_prompt": recipe.negative_prompt}, reference_uri,
+                reference_content=reference_content, reference_filename=reference_filename,
             )
-            task_states.transition(run, TaskLifecycleStatus.submitting, "Submitting to provider")
-            try:
-                task = await remote_provider.submit(MediaRequest(
-                    prompt=recipe.prompt, model=recipe.model, idempotency_key=idempotency_key,
-                    parameters=recipe.parameters, reference_uri=shot.reference_asset_ids[0] if shot.reference_asset_ids else None,
-                ))
-            except Exception as exc:
-                normalized = remote_provider.normalize_error(exc)
-                if normalized.outcome_unknown:
-                    task_states.mark_unknown(run, exc)
-                    project.generation_runs.append(run)
-                    shot.status = "reconciling"
-                    add_audit(project, principal, "generation.unknown", "run", run.id, error_code=normalized.code)
-                    store.save(project)
-                    return {"run": run, "recipe": recipe, "route": decision, "deduplicated": False, "reconciliation_required": True}
-                task_states.transition(run, TaskLifecycleStatus.failed, normalized.message)
-                run.error_code, run.error_message = normalized.code, normalized.message
-                project.generation_runs.append(run)
-                add_audit(project, principal, "generation.failed", "run", run.id, error_code=normalized.code)
-                store.save(project)
-                raise HTTPException(502, f"Provider submission failed: {normalized.message}") from exc
-            run.provider_task_id = task.id
-            task_states.transition(run, TaskLifecycleStatus.submitted, "Provider returned task id")
-            task_states.transition(run, _task_lifecycle(task.status), f"Provider state is {task.status.value}")
+            if run.lifecycle_status == TaskLifecycleStatus.unknown:
+                shot.status = "reconciling"
+                return {"run": run, "recipe": recipe, "route": decision, "deduplicated": False, "reconciliation_required": True}
         else:
             run = mock_provider.submit(shot, recipe, project.id)
-        project.generation_runs.append(run)
+            project.generation_runs.append(run)
         shot.status = "generating"
         add_audit(project, principal, "generation.submitted", "run", run.id, provider=provider_name, recipe_id=recipe.id)
         store.save(project)
@@ -314,12 +501,13 @@ def create_app(
         run = next((item for item in project.generation_runs if item.id == run_id), None)
         if not run:
             raise HTTPException(404, "Generation run not found")
-        if remote_provider:
+        bound_provider = provider_for_run(run)
+        if bound_provider:
             try:
-                task = await remote_provider.query(run.provider_task_id)
+                task = await bound_provider.query(run.provider_task_id)
             except Exception as exc:
                 run.retry_count += 1
-                normalized = remote_provider.normalize_error(exc)
+                normalized = bound_provider.normalize_error(exc)
                 if normalized.outcome_unknown and run.lifecycle_status in {TaskLifecycleStatus.submitted, TaskLifecycleStatus.running}:
                     task_states.mark_unknown(run, exc)
                 store.save(project)
@@ -328,16 +516,33 @@ def create_app(
             if target != run.lifecycle_status:
                 task_states.transition(run, target, "Provider status poll")
             if task.status == ProviderState.succeeded:
-                result = await remote_provider.fetch_result(run.provider_task_id)
-                run.output_uri, run.cost, run.elapsed_sec = result.uri, result.cost, result.elapsed_sec
+                result = await bound_provider.fetch_result(run.provider_task_id)
+                run.cost, run.elapsed_sec = result.cost, result.elapsed_sec
+                if not run.artifact_id:
+                    try:
+                        await materialize_provider_result(project, run, result.uri)
+                    except (ArtifactValidationError, httpx.HTTPError) as exc:
+                        run.error_code, run.error_message = "ARTIFACT_MATERIALIZATION_FAILED", str(exc)
+                        store.save(project)
+                        raise HTTPException(502, f"Provider task succeeded but artifact materialization failed: {exc}") from exc
         else:
             mock_provider.advance(run)
         shot = next(item for item in project.shots if item.id == run.shot_id)
         if run.status == GenerationStatus.completed:
-            shot.status = "completed"
-            if not any(cost.shot_id == shot.id and cost.category == "video" for cost in project.cost_events):
-                run.cost = 0.18 if provider_name == "mock" else run.cost
-                project.cost_events.append(CostEvent(id=f"cost_{uuid4().hex[:8]}", shot_id=shot.id, category="video", provider=provider_name, amount=run.cost))
+            if run.media_kind == MediaKind.keyframe:
+                shot.status = "keyframe_review"
+            elif run.media_kind == MediaKind.audio:
+                shot.status = "audio_ready"
+            else:
+                artifact = next((item for item in project.media_artifacts if item.id == run.artifact_id), None)
+                inspection = artifact.metadata.get("inspection", {}) if artifact else {}
+                shot.status = "completed" if not artifact or inspection.get("hard_gate_passed", True) else "needs_review"
+            if not any(cost.run_id == run.id for cost in project.cost_events):
+                run.cost = 0.18 if run.provider == "mock" else run.cost
+                project.cost_events.append(CostEvent(
+                    id=f"cost_{uuid4().hex[:8]}", shot_id=shot.id, category=run.media_kind.value,
+                    provider=run.provider, amount=run.cost, run_id=run.id,
+                ))
                 add_audit(project, principal, "generation.succeeded", "run", run.id, cost=run.cost)
         store.save(project)
         return run
@@ -351,10 +556,11 @@ def create_app(
             raise HTTPException(404, "Generation run not found")
         if run.lifecycle_status != TaskLifecycleStatus.unknown:
             return {"run": run, "reconciled": False, "reason": "task is not UNKNOWN"}
-        if remote_provider is None:
+        bound_provider = provider_for_run(run)
+        if bound_provider is None:
             raise HTTPException(409, "Mock tasks never require provider reconciliation")
         try:
-            task = await remote_provider.recover(run.idempotency_key)
+            task = await bound_provider.recover(run.idempotency_key)
         except Exception as exc:
             run.retry_count += 1
             store.save(project)
@@ -394,18 +600,243 @@ def create_app(
         )
         return {"shot_id": shot.id, "inspection": inspection, "metric_source": "decoded-media"}
 
+    @app.put("/api/projects/{project_id}/shots/{shot_id}/artifacts/{kind}", status_code=201)
+    async def upload_shot_artifact(
+        project_id: str,
+        shot_id: str,
+        kind: MediaKind,
+        request: Request,
+        filename: str = Header(alias="X-Filename"),
+        checksum: str | None = Header(default=None, alias="X-Content-SHA256"),
+        principal: Principal = Depends(current_principal),
+    ):
+        authorize(principal, "edit")
+        if kind not in {MediaKind.keyframe, MediaKind.video, MediaKind.audio}:
+            raise HTTPException(422, "Shot uploads support keyframe, video and audio artifacts")
+        project, shot, _ = shot_and_previous(project_id, shot_id, principal)
+        declared = int(request.headers.get("content-length", "0") or 0)
+        if declared > MAX_BYTES[kind]:
+            raise HTTPException(413, f"{kind.value} artifact exceeds the size limit")
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > MAX_BYTES[kind]:
+                raise HTTPException(413, f"{kind.value} artifact exceeds the size limit")
+            chunks.append(chunk)
+        try:
+            artifact = artifact_store.save_bytes(
+                project, kind, filename, b"".join(chunks), shot.id, "upload", checksum,
+            )
+        except ArtifactValidationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        attach_measurement(project, artifact)
+        add_audit(project, principal, "artifact.uploaded", "artifact", artifact.id, kind=kind.value, measured=artifact.measured)
+        store.save(project)
+        return {
+            "artifact": artifact,
+            "content_url": f"/api/projects/{project.id}/artifacts/{artifact.id}/content",
+        }
+
+    @app.get("/api/projects/{project_id}/artifacts/{artifact_id}/content")
+    def get_artifact_content(project_id: str, artifact_id: str, principal: Principal = Depends(current_principal)):
+        authorize(principal, "read")
+        project = _project_or_404(store, project_id, principal.organization_id)
+        artifact = next((item for item in project.media_artifacts if item.id == artifact_id), None)
+        if not artifact:
+            raise HTTPException(404, "Artifact not found")
+        path = artifact_store.path_for(artifact)
+        if not path.is_file():
+            raise HTTPException(404, "Artifact file not found")
+        return FileResponse(path, media_type=artifact.mime_type, filename=Path(artifact.storage_path).name)
+
+    @app.post("/api/projects/{project_id}/shots/{shot_id}/keyframes/generate", status_code=202)
+    async def generate_keyframes(
+        project_id: str,
+        shot_id: str,
+        request: GenerateKeyframesRequest,
+        principal: Principal = Depends(current_principal),
+    ):
+        authorize(principal, "generate")
+        if image_provider is None:
+            raise HTTPException(503, detail={
+                "message": "Real image provider is not configured",
+                "required": ["MANGAFLOW_IMAGE_PROVIDER", "IMAGE_PROVIDER_BASE_URL", "IMAGE_PROVIDER_API_KEY"],
+            })
+        project, shot, _ = shot_and_previous(project_id, shot_id, principal)
+        group_id = request.request_id or f"keyframes_{uuid4().hex[:12]}"
+        model = request.model or env.get("IMAGE_MODEL", "mangaflow-keyframe-v1")
+        prompt = ", ".join(filter(None, [
+            project.style, shot.title, shot.action, shot.shot_size, shot.camera_motion,
+            "vertical manga keyframe, consistent character identity, production concept art",
+        ]))
+        base_request = MediaRequest(prompt, model, group_id, {"width": 1024, "height": 1792})
+        estimated = image_provider.estimate(base_request).amount * request.count
+        current_cost = sum(item.amount for item in project.cost_events)
+        if current_cost + estimated > project.budget_limit:
+            raise HTTPException(402, detail={"message": "Project cost cap would be exceeded", "estimated_cost": estimated})
+        runs = []
+        deduplicated = True
+        for index in range(request.count):
+            candidate_id = f"candidate_{group_id}_{index + 1}"
+            recipe_id = f"keyframe_{group_id}_{index + 1}"
+            existing = next((item for item in project.generation_runs if item.recipe_id == recipe_id and item.status != GenerationStatus.failed), None)
+            if existing:
+                runs.append(existing)
+                continue
+            deduplicated = False
+            run = await submit_external_run(
+                project, shot, principal, MediaKind.keyframe, image_provider_name, image_provider,
+                model, prompt, recipe_id,
+                {"width": 1024, "height": 1792, "seed": int(hashlib.sha256(candidate_id.encode()).hexdigest()[:8], 16)},
+                candidate_id=candidate_id,
+            )
+            runs.append(run)
+        shot.status = "keyframe_generating"
+        store.save(project)
+        return {"request_id": group_id, "runs": runs, "data_mode": "real-provider", "deduplicated": deduplicated}
+
+    @app.post("/api/projects/{project_id}/shots/{shot_id}/speech/generate", status_code=202)
+    async def generate_speech(
+        project_id: str,
+        shot_id: str,
+        request: GenerateSpeechRequest,
+        principal: Principal = Depends(current_principal),
+    ):
+        authorize(principal, "generate")
+        if tts_provider is None:
+            raise HTTPException(503, detail={
+                "message": "Real TTS provider is not configured",
+                "required": ["MANGAFLOW_TTS_PROVIDER", "TTS_PROVIDER_BASE_URL", "TTS_PROVIDER_API_KEY"],
+            })
+        project, shot, _ = shot_and_previous(project_id, shot_id, principal)
+        text = (request.text or shot.dialogue or shot.action).strip()
+        if not text:
+            raise HTTPException(422, "Shot has no dialogue or narration text")
+        request_id = request.request_id or f"speech_{uuid4().hex[:12]}"
+        recipe_id = f"speech_{shot.id}_{request_id}"
+        existing = next((item for item in project.generation_runs if item.recipe_id == recipe_id and item.status != GenerationStatus.failed), None)
+        if existing:
+            return {"request_id": request_id, "run": existing, "deduplicated": True, "data_mode": "real-provider"}
+        character = next((item for item in project.characters if item.id in shot.characters), None)
+        voice = request.voice or (character.voice if character else env.get("TTS_DEFAULT_VOICE", "narrator"))
+        model = request.model or env.get("TTS_MODEL", "mangaflow-tts-v1")
+        estimate_request = MediaRequest(text, model, request_id, {"voice": voice, "duration": shot.duration_sec})
+        estimated = tts_provider.estimate(estimate_request).amount
+        if sum(item.amount for item in project.cost_events) + estimated > project.budget_limit:
+            raise HTTPException(402, "Project cost cap would be exceeded")
+        run = await submit_external_run(
+            project, shot, principal, MediaKind.audio, tts_provider_name, tts_provider,
+            model, text, recipe_id, {"voice": voice, "duration": shot.duration_sec, "format": "wav"},
+        )
+        store.save(project)
+        return {"request_id": request_id, "run": run, "deduplicated": False, "data_mode": "real-provider"}
+
     @app.post("/api/projects/{project_id}/shots/{shot_id}/approve-keyframe")
-    def approve_keyframe(project_id: str, shot_id: str, principal: Principal = Depends(current_principal)):
+    def approve_keyframe(
+        project_id: str,
+        shot_id: str,
+        request: ApproveKeyframeRequest | None = None,
+        principal: Principal = Depends(current_principal),
+    ):
         authorize(principal, "review")
         project, shot, _ = shot_and_previous(project_id, shot_id, principal)
-        existing = next((item for item in project.approvals if item.target_type == "keyframe" and item.target_id == shot.id), None)
+        request = request or ApproveKeyframeRequest()
+        artifact = None
+        if request.artifact_id:
+            artifact = next((item for item in project.media_artifacts if item.id == request.artifact_id), None)
+            if not artifact or artifact.shot_id != shot.id or artifact.kind != MediaKind.keyframe:
+                raise HTTPException(422, "Selected keyframe artifact does not belong to this shot")
+        existing = next((item for item in project.approvals if item.target_type == "keyframe" and item.target_id == shot.id and item.status == "approved"), None)
         if existing:
-            return {"approval": existing, "deduplicated": True}
-        approval = Approval(id=f"approval_{uuid4().hex[:8]}", target_type="keyframe", target_id=shot.id, status="approved", reviewer=principal.user_id, organization_id=principal.organization_id)
+            if artifact and shot.first_frame_asset_id != artifact.id:
+                existing.status = "superseded"
+            else:
+                return {"approval": existing, "artifact": artifact, "deduplicated": True}
+        if artifact:
+            for candidate in project.media_artifacts:
+                if candidate.shot_id == shot.id and candidate.kind == MediaKind.keyframe:
+                    candidate.review_status = ArtifactReviewStatus.approved if candidate.id == artifact.id else ArtifactReviewStatus.rejected
+            shot.first_frame_asset_id = artifact.id
+            shot.thumbnail = f"artifact://{artifact.id}"
+        approval = Approval(
+            id=f"approval_{uuid4().hex[:8]}", target_type="keyframe", target_id=shot.id,
+            status="approved", reviewer=principal.user_id, organization_id=principal.organization_id,
+            comment=request.comment,
+        )
         project.approvals.append(approval)
-        add_audit(project, principal, "keyframe.approved", "shot", shot.id)
+        add_audit(project, principal, "keyframe.approved", "shot", shot.id, artifact_id=artifact.id if artifact else None)
         store.save(project)
-        return {"approval": approval, "deduplicated": False}
+        return {"approval": approval, "artifact": artifact, "deduplicated": False}
+
+    @app.post("/api/projects/{project_id}/subtitles/build", status_code=201)
+    def build_subtitles(
+        project_id: str,
+        request: BuildSubtitlesRequest,
+        principal: Principal = Depends(current_principal),
+    ):
+        authorize(principal, "edit")
+        project = _project_or_404(store, project_id, principal.organization_id)
+        cues = subtitle_service.build(project, request.include_action_as_narration)
+        if not cues:
+            raise HTTPException(422, "No dialogue or narration text is available for subtitles")
+        srt = subtitle_service.render_srt(cues)
+        try:
+            artifact = artifact_store.save_bytes(
+                project, MediaKind.subtitle, f"{project.id}.srt", srt.encode("utf-8"),
+                None, "timeline", metadata={"cue_count": len(cues)},
+            )
+        except ArtifactValidationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        add_audit(project, principal, "subtitles.built", "artifact", artifact.id, cue_count=len(cues))
+        store.save(project)
+        return {"artifact": artifact, "cues": cues, "data_mode": "derived-from-shot-timeline"}
+
+    @app.post("/api/projects/{project_id}/assemble", status_code=201)
+    async def assemble_project(
+        project_id: str,
+        request: AssembleProjectRequest,
+        principal: Principal = Depends(current_principal),
+    ):
+        authorize(principal, "export")
+        project = _project_or_404(store, project_id, principal.organization_id)
+        if not any(item.kind == MediaKind.subtitle for item in project.media_artifacts):
+            cues = subtitle_service.build(project, True)
+            if not cues:
+                raise HTTPException(422, "No subtitle timeline can be generated")
+            artifact_store.save_bytes(
+                project, MediaKind.subtitle, f"{project.id}.srt",
+                subtitle_service.render_srt(cues).encode("utf-8"), None, "timeline",
+                metadata={"cue_count": len(cues)},
+            )
+            add_audit(project, principal, "subtitles.built", "project", project.id, cue_count=len(cues), automatic=True)
+            store.save(project)
+        try:
+            artifact, inspection = await run_in_threadpool(
+                assembler.assemble, project, artifact_store,
+                request.require_audio, request.require_approved_keyframes,
+            )
+        except AssemblyBlocked as exc:
+            raise HTTPException(409, detail={"message": "Assembly prerequisites are not satisfied", "blockers": exc.blockers}) from exc
+        except (AssemblyFailed, ArtifactValidationError) as exc:
+            raise HTTPException(502, f"Final assembly failed: {exc}") from exc
+        manifest = DeliveryManifest(
+            id=f"delivery_{uuid4().hex[:10]}", organization_id=project.organization_id,
+            project_id=project.id, status="assembled", assembled=True,
+            preset=assembler.preflight(image_provider_name, provider_name, tts_provider_name).model_dump(),
+            tracks=[DeliveryTrack(
+                kind="final_video", uri=f"artifact://{artifact.id}",
+                checksum_sha256=artifact.checksum_sha256, file_size=artifact.file_size, ready=True,
+            )],
+        )
+        project.delivery_manifests.append(manifest)
+        project.workflow_status = WorkflowStatus.completed
+        add_audit(project, principal, "delivery.assembled", "artifact", artifact.id, checksum=artifact.checksum_sha256)
+        store.save(project)
+        return {
+            "status": "assembled", "assembled": True, "artifact": artifact,
+            "inspection": inspection, "manifest": manifest,
+            "download_url": f"/api/projects/{project.id}/artifacts/{artifact.id}/content",
+        }
 
     @app.post("/api/projects/{project_id}/quality-run")
     def run_project_quality(project_id: str, principal: Principal = Depends(current_principal)):
@@ -413,15 +844,18 @@ def create_app(
         project = _project_or_404(store, project_id, principal.organization_id)
         measured, skipped = [], []
         for run in project.generation_runs:
+            if run.media_kind != MediaKind.video:
+                continue
             shot = next((item for item in project.shots if item.id == run.shot_id), None)
             if not shot or not run.output_uri or run.output_uri.startswith("mock://"):
                 skipped.append({"shot_id": run.shot_id, "reason": "no decoded media artifact"})
                 continue
             try:
-                path = _safe_media_path(media_root, run.output_uri.removeprefix("file://"))
+                artifact = next((item for item in project.media_artifacts if item.id == run.artifact_id), None)
+                path = artifact_store.path_for(artifact) if artifact else _safe_media_path(media_root, run.output_uri.removeprefix("file://"))
                 measured.append({"shot_id": shot.id, "inspection": media_quality.inspect(path, shot.duration_sec)})
-            except HTTPException as exc:
-                skipped.append({"shot_id": run.shot_id, "reason": str(exc.detail)})
+            except (HTTPException, ArtifactValidationError) as exc:
+                skipped.append({"shot_id": run.shot_id, "reason": str(getattr(exc, "detail", exc))})
         return {
             "status": "completed" if measured and not skipped else "partial" if measured else "no_media",
             "metric_source": "decoded-media", "measured": measured, "skipped": skipped,
@@ -444,7 +878,7 @@ def create_app(
             "status": "manifest_only" if manifest.blockers else manifest.status,
             "manifest": manifest,
             "manifest_path": str(path),
-            "assembled": False,
+            "assembled": manifest.assembled,
         }
 
     @app.post("/api/projects/{project_id}/workflow")
@@ -459,9 +893,10 @@ def create_app(
             for run in project.generation_runs:
                 if run.status not in {GenerationStatus.queued, GenerationStatus.running}:
                     continue
-                if remote_provider:
+                bound_provider = provider_for_run(run)
+                if bound_provider:
                     try:
-                        await remote_provider.cancel(run.provider_task_id)
+                        await bound_provider.cancel(run.provider_task_id)
                         task_states.transition(run, TaskLifecycleStatus.cancelled, "Cancelled by workflow", principal.user_id)
                     except Exception as exc:
                         run.retry_count += 1
@@ -495,20 +930,22 @@ def create_app(
     @app.get("/api/provider/capabilities")
     def provider_capabilities(principal: Principal = Depends(current_principal)):
         authorize(principal, "read")
-        if remote_provider is None:
-            return {
-                "provider": "mock",
-                "data_mode": "mock",
-                "capabilities": {
-                    "media_kinds": ["image", "video"],
-                    "supports_reference_image": True,
-                    "supports_last_frame": False,
-                    "supports_webhook": False,
-                    "supports_idempotency_recovery": True,
-                    "max_duration_sec": 20,
-                },
-            }
-        return {"provider": provider_name, "data_mode": "configured", "capabilities": remote_provider.capabilities()}
+        bindings = {
+            "image": (image_provider_name, image_provider),
+            "video": (provider_name, remote_provider),
+            "tts": (tts_provider_name, tts_provider),
+        }
+        return {
+            "data_mode": "configured" if any(provider for _, provider in bindings.values()) else "mock-or-disabled",
+            "stages": {
+                stage: {
+                    "provider": name,
+                    "configured": provider is not None,
+                    "capabilities": provider.capabilities() if provider else None,
+                }
+                for stage, (name, provider) in bindings.items()
+            },
+        }
 
     @app.get("/api/projects/{project_id}/metrics")
     def project_metrics(project_id: str, principal: Principal = Depends(current_principal)):

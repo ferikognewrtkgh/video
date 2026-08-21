@@ -17,11 +17,12 @@
 | 连续性图谱 | 相邻状态、`must_preserve`、场景地点、服装归属、前序顺序、缺失依赖和依赖环检测 | 尚未使用图数据库 |
 | Prompt 编译 | 编入项目风格、角色 AppearanceVersion、场景圣经、镜头动作和稳定语义哈希 | 不运行提示词自动优化模型 |
 | 生成路由 | 2.5D、肖像驱动、I2V、Premium I2V、T2V 规则路由和成本解释 | 规则策略，不包装成学习型 Router |
-| Provider | Mock、ComfyUI、云端任务 API、TTS 抽象；能力/报价/健康/错误归一化/Webhook 验签/幂等恢复契约 | CI 使用 MockTransport，不代表真实供应商 SLA |
+| Provider | 图片、I2V、TTS 独立绑定；支持 ComfyUI 与云端任务 API、健康检查、报价、错误归一化、幂等恢复和产物收敛 | CI 的合同测试不代表真实供应商 SLA；真实凭据尚未配置 |
 | 工作流 | 原子 JSON Checkpoint、乐观锁、预算封顶、暂停/恢复/取消；任务拥有 CREATED 到 UNKNOWN 的显式时间线与对账接口 | 尚未接入 Temporal/PostgreSQL |
 | 媒体质检 | OpenCV 真实解码，检测 FPS、时长、分辨率、黑帧、闪烁和参考图像差异 | 参考相似度是像素代理指标，尚无 DINO/CLIP/VLM/人脸 Embedding |
-| 交付 | Storyboard CSV 原子交换、运营指标、带文件大小与 SHA-256 的交付 Manifest | 没有完整媒体时不会伪造 MP4；FFmpeg 拼片尚未实现 |
-| 前端 | 七个创作页面，新增协作效率与审计视图；生成、暂停、关键帧批准、质检和导出操作连接 API | 候选图和演示进度仍是 Mock，并已显式标记 |
+| 真实媒体 | 原始二进制上传、Provider 输出域名白名单、安全落盘、格式校验、SHA-256 与 OpenCV 实测 | 当前仓库没有真实供应商产物；Mock 不能进入真实交付 |
+| 交付 | Shot 时间轴生成 SRT；FFmpeg 统一 1080×1920/24FPS，拼接视频与音频并写入字幕轨；ffprobe 验证三轨 | 本机尚未安装 FFmpeg；CI 会安装真实二进制运行集成测试 |
+| 前端 | 真实关键帧生成/轮询/选择、I2V、批量 TTS、字幕与成片按钮已连接 API；真实产物可下载 | Provider 未配置时仍显示明确的 Mock 候选，不会伪造生成结果 |
 
 ## 与固定 Demo 的区别
 
@@ -46,8 +47,10 @@ python -m pytest --cov=app --cov-config=../.coveragerc --cov-report=term-missing
 当前结果：
 
 ```text
-42 passed
-Total branch coverage: 86.23%
+56 passed, 1 skipped（本机未安装 ffmpeg/ffprobe）
+总覆盖率：83.01%
+前端组件测试、TypeScript 类型检查、生产构建：通过
+Evaluation：20/20（确定性规则与工作流回归测试，不代表生成质量准确率）
 ```
 
 测试不是只调用接口函数，覆盖：
@@ -121,11 +124,16 @@ npm run dev
 | `POST` | `/api/projects` | 运行结构化改编并创建项目 |
 | `GET` | `/api/projects/{id}/continuity` | 执行项目级连续性检查 |
 | `POST` | `/api/projects/{id}/shots/{shot}/generate` | 幂等提交单镜头任务 |
+| `POST` | `/api/projects/{id}/shots/{shot}/keyframes/generate` | 提交 2–4 个真实关键帧候选 |
+| `POST` | `/api/projects/{id}/shots/{shot}/speech/generate` | 提交真实 TTS 任务 |
 | `POST` | `/api/projects/{id}/runs/{run}/tick` | 推进/查询 Provider 任务 |
+| `PUT` | `/api/projects/{id}/shots/{shot}/artifacts/{kind}` | 上传真实图片、视频或音频 |
 | `POST` | `/api/projects/{id}/shots/{shot}/inspect-media` | 从真实媒体计算硬门禁 |
 | `POST` | `/api/projects/{id}/shots/{shot}/approve-keyframe` | 记录人工审核 |
 | `POST` | `/api/projects/{id}/workflow` | 启动、暂停、恢复或取消 |
 | `POST` | `/api/projects/{id}/quality-run` | 只质检存在真实媒体的镜头 |
+| `POST` | `/api/projects/{id}/subtitles/build` | 从 Shot 时间轴生成 SRT |
+| `POST` | `/api/projects/{id}/assemble` | FFmpeg 合成并验证可播放 MP4 |
 | `POST` | `/api/projects/{id}/export` | 生成导出 Manifest |
 
 ## Provider 配置
@@ -152,7 +160,7 @@ CLOUD_VIDEO_BASE_URL=https://provider.example/v1
 CLOUD_VIDEO_API_KEY=...
 ```
 
-业务代码不依赖具体 Provider。请求会记录 Prompt 模板版本、输入哈希、Provider task ID、幂等键、成本、耗时和输出 URI。
+业务代码不依赖具体 Provider。请求会记录 Prompt 模板版本、输入哈希、Provider task ID、幂等键、成本、耗时和本地 Artifact。完整接入变量、异步 API 合同和验收步骤见 [docs/REAL_PIPELINE.md](docs/REAL_PIPELINE.md)。
 
 ## 架构
 
@@ -164,9 +172,10 @@ flowchart LR
   Gate --> Director[ShotSpec + Prompt Compiler]
   Director --> Router[Render Router]
   Router --> Provider[Mock / ComfyUI / Cloud]
-  Provider --> Media[真实媒体文件]
-  Media --> QA[OpenCV 硬门禁]
-  QA --> Manifest[导出 Manifest]
+  Provider --> Media[白名单下载 / 真实上传]
+  Media --> QA[解码 + SHA-256 + OpenCV]
+  QA --> AV[TTS + SRT + FFmpeg]
+  AV --> Manifest[MP4 + 三轨验证 + Manifest]
 ```
 
 CI 位于 [.github/workflows/ci.yml](.github/workflows/ci.yml)，每次提交运行后端覆盖率、20 镜头评测、前端组件测试、类型检查和生产构建。
@@ -178,5 +187,5 @@ CI 位于 [.github/workflows/ci.yml](.github/workflows/ci.yml)，每次提交运
 - Temporal Durable Workflow 和 PostgreSQL 数据迁移；
 - 云端结构化 LLM 的生产接入与评测；
 - DINO/CLIP、人脸 Embedding、光流与 VLM 软评分；
-- FFmpeg、TTS、字幕、BGM 和转场的真实成片；
+- 真实供应商凭据下的首条 20–60 秒验收成片、BGM 和转场；
 - 带参考媒体的真实 I2V 供应商端到端样例。

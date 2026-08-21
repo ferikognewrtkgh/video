@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Protocol
 
@@ -27,6 +27,9 @@ class MediaRequest:
     idempotency_key: str
     parameters: Dict[str, Any]
     reference_uri: Optional[str] = None
+    last_frame_uri: Optional[str] = None
+    reference_content: Optional[bytes] = None
+    reference_filename: Optional[str] = None
 
 
 @dataclass
@@ -113,6 +116,20 @@ class ComfyUIProvider(_HTTPProvider):
         return False
 
     async def submit(self, request: MediaRequest) -> ProviderTask:
+        if request.reference_content:
+            filename = request.reference_filename or "approved-keyframe.png"
+            async with self.client(30) as client:
+                response = await client.post(
+                    f"{self.base_url}/upload/image",
+                    files={"image": (filename, request.reference_content, "application/octet-stream")},
+                    data={"type": "input", "overwrite": "true"},
+                )
+                response.raise_for_status()
+                uploaded = response.json()
+            if not uploaded.get("name"):
+                raise ProviderProtocolError("ComfyUI image upload response is missing name")
+            uploaded_name = "/".join(filter(None, [uploaded.get("subfolder", ""), uploaded["name"]]))
+            request = replace(request, reference_uri=uploaded_name)
         payload = {"prompt": self._compile_workflow(request), "client_id": request.idempotency_key}
         async with self.client(30) as client:
             response = await client.post(f"{self.base_url}/prompt", json=payload)
@@ -162,12 +179,31 @@ class ComfyUIProvider(_HTTPProvider):
 
     def _compile_workflow(self, request: MediaRequest) -> Dict[str, Any]:
         workflow = copy.deepcopy(self.workflow)
+        serialized_template = json.dumps(workflow, ensure_ascii=False)
+        if request.reference_uri and "{{reference_uri}}" not in serialized_template and not request.parameters.get("workflow_inputs"):
+            raise ProviderProtocolError("ComfyUI I2V workflow must consume {{reference_uri}} or explicit workflow_inputs")
+        replacements = {
+            "{{prompt}}": request.prompt,
+            "{{reference_uri}}": request.reference_uri,
+            "{{last_frame_uri}}": request.last_frame_uri,
+            "{{negative_prompt}}": request.parameters.get("negative_prompt", ""),
+            "{{seed}}": request.parameters.get("seed"),
+            "{{duration}}": request.parameters.get("duration"),
+        }
         for node in workflow.values():
             inputs = node.get("inputs", {})
-            if "text" in inputs and "negative" not in str(node.get("class_type", "")).lower():
+            original_text = inputs.get("text")
+            for key, value in list(inputs.items()):
+                if isinstance(value, str) and value in replacements and replacements[value] is not None:
+                    inputs[key] = replacements[value]
+            if "text" in inputs and original_text != "{{negative_prompt}}" and "negative" not in str(node.get("class_type", "")).lower():
                 inputs["text"] = request.prompt
             if "seed" in inputs and "seed" in request.parameters:
                 inputs["seed"] = request.parameters["seed"]
+        for node_id, overrides in request.parameters.get("workflow_inputs", {}).items():
+            if node_id not in workflow or not isinstance(overrides, dict):
+                raise ProviderProtocolError(f"Unknown ComfyUI workflow override node: {node_id}")
+            workflow[node_id].setdefault("inputs", {}).update(overrides)
         return workflow
 
 
@@ -198,6 +234,8 @@ class OpenAICompatibleMediaProvider(_HTTPProvider):
         payload = {"model": request.model, "prompt": request.prompt, **request.parameters}
         if request.reference_uri:
             payload["reference_uri"] = request.reference_uri
+        if request.last_frame_uri:
+            payload["last_frame_uri"] = request.last_frame_uri
         headers = {**self.headers, "Idempotency-Key": request.idempotency_key}
         try:
             async with self.client(60) as client:
@@ -292,6 +330,42 @@ def create_media_provider(
             raise ValueError("CLOUD_VIDEO_BASE_URL and CLOUD_VIDEO_API_KEY are required")
         return "cloud-video", OpenAICompatibleMediaProvider(base_url, key, "video", transport)
     raise ValueError(f"Unsupported MANGAFLOW_PROVIDER: {name}")
+
+
+def create_stage_provider(
+    stage: str,
+    environment: Mapping[str, str] | None = None,
+    comfy_workflow: Dict[str, Any] | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[str, MediaProvider | None]:
+    """Create optional real providers for the image and speech stages.
+
+    A missing stage is deliberately returned as disabled instead of silently
+    substituting Mock output into a production run.
+    """
+    if stage not in {"image", "tts"}:
+        raise ValueError(f"Unsupported production stage: {stage}")
+    env = environment or os.environ
+    prefix = "IMAGE" if stage == "image" else "TTS"
+    name = env.get(f"MANGAFLOW_{prefix}_PROVIDER", "disabled").lower()
+    if name in {"disabled", "none", "mock"}:
+        return name, None
+    if name == "comfyui":
+        if stage != "image":
+            raise ValueError("ComfyUI auxiliary provider is currently supported only for image generation")
+        base_url = env.get("COMFYUI_BASE_URL")
+        if not base_url or comfy_workflow is None:
+            raise ValueError("COMFYUI_BASE_URL and COMFYUI_IMAGE_WORKFLOW_PATH are required")
+        return "comfyui-image", ComfyUIProvider(base_url, comfy_workflow, transport)
+    if name in {"cloud", f"cloud-{stage}"}:
+        base_url = env.get(f"{prefix}_PROVIDER_BASE_URL")
+        api_key = env.get(f"{prefix}_PROVIDER_API_KEY")
+        if not base_url or not api_key:
+            raise ValueError(f"{prefix}_PROVIDER_BASE_URL and {prefix}_PROVIDER_API_KEY are required")
+        if stage == "tts":
+            return "cloud-tts", TTSProvider(base_url, api_key, transport)
+        return "cloud-image", OpenAICompatibleMediaProvider(base_url, api_key, "image", transport)
+    raise ValueError(f"Unsupported MANGAFLOW_{prefix}_PROVIDER: {name}")
 
 
 def _normalize_http_error(error: Exception) -> NormalizedProviderError:

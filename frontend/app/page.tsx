@@ -10,9 +10,9 @@ import {
   X, Zap,
 } from "lucide-react";
 import { demoProject } from "@/lib/demo-data";
-import { NavKey, OperationalMetrics, Project, Shot } from "@/lib/types";
+import { MediaArtifact, NavKey, OperationalMetrics, Project, Shot } from "@/lib/types";
 import { MockBadge } from "@/components/MockBadge";
-import { isMockProject } from "@/lib/presentation";
+import { isMockProject, latestFinalArtifact, realArtifactsForShot } from "@/lib/presentation";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -52,6 +52,25 @@ export default function Studio() {
   const mockData = isMockProject(project, apiOnline);
   const flash = (message: string) => { setNotice(message); setTimeout(() => setNotice(""), 2600); };
 
+  async function refreshProject() {
+    const response = await fetch(`${API}/api/projects/${project.id}`);
+    if (!response.ok) throw new Error(await response.text());
+    const latest = await response.json();
+    setProject(latest);
+    return latest as Project;
+  }
+
+  async function pollRun(runId: string) {
+    for (let attempt=0; attempt<90; attempt++) {
+      const response = await fetch(`${API}/api/projects/${project.id}/runs/${runId}/tick`, {method:"POST"});
+      if (!response.ok) throw new Error(await response.text());
+      const run = await response.json();
+      if (["completed","failed","cancelled"].includes(run.status) || run.lifecycle_status==="unknown") return run;
+      await new Promise(resolve=>setTimeout(resolve,1500));
+    }
+    throw new Error("Provider task polling timed out");
+  }
+
   async function workflow(command: string) {
     setBusy(true);
     try {
@@ -72,10 +91,13 @@ export default function Studio() {
     if (apiOnline) {
       try {
         const r = await fetch(`${API}/api/projects/${project.id}/shots/${shot.id}/generate`, { method: "POST" });
-        if (!r.ok) throw new Error();
+        const result = await r.json();
+        if (!r.ok) throw new Error(result.detail?.message||result.detail||"镜头生成提交失败");
         setProject(p => ({ ...p, shots: p.shots.map(s => s.id === shot.id ? { ...s, status: "generating" } : s) }));
         flash(`${shot.id.toUpperCase()} 已进入队列，仅重跑当前镜头`);
-      } catch { flash("连续性门禁未通过，请先解决冲突"); }
+        await pollRun(result.run.id);
+        await refreshProject();
+      } catch (error) { flash(error instanceof Error?error.message:"镜头生成失败"); }
     } else {
       setProject(p => ({ ...p, shots: p.shots.map(s => s.id === shot.id ? { ...s, status: "generating" } : s) }));
       flash("演示模式：镜头已进入 Mock Provider 队列");
@@ -83,10 +105,63 @@ export default function Studio() {
     setBusy(false);
   }
 
-  async function approveKeyframe() {
+  async function approveKeyframe(artifactId?: string) {
     if (!apiOnline) { flash("演示模式：未写入真实审核记录"); return; }
-    const response = await fetch(`${API}/api/projects/${project.id}/shots/${shot.id}/approve-keyframe`, { method: "POST" });
+    const response = await fetch(`${API}/api/projects/${project.id}/shots/${shot.id}/approve-keyframe`, {
+      method: "POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(artifactId?{artifact_id:artifactId}:{})
+    });
+    if (response.ok) await refreshProject();
     flash(response.ok ? `${shot.id.toUpperCase()} 关键帧审核已记录` : "关键帧审核失败");
+  }
+
+  async function generateKeyframes() {
+    if (!apiOnline) { flash("演示模式：没有调用真实图片 Provider"); return; }
+    setBusy(true);
+    try {
+      const response = await fetch(`${API}/api/projects/${project.id}/shots/${shot.id}/keyframes/generate`, {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({count:3,request_id:`ui-${crypto.randomUUID()}`}),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail?.message||"关键帧提交失败");
+      flash(`已提交 ${result.runs.length} 个真实关键帧候选`);
+      await Promise.all(result.runs.map((run:{id:string})=>pollRun(run.id)));
+      await refreshProject();
+    } catch (error) { flash(error instanceof Error?error.message:"关键帧生成失败"); }
+    setBusy(false);
+  }
+
+  async function prepareAudioAndSubtitles() {
+    if (!apiOnline) { flash("演示模式：没有调用真实 TTS"); return; }
+    setBusy(true);
+    try {
+      const subtitle = await fetch(`${API}/api/projects/${project.id}/subtitles/build`, {method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+      if (!subtitle.ok) throw new Error("字幕时间轴生成失败");
+      const runs:{id:string}[]=[];
+      for (const item of project.shots) {
+        const response=await fetch(`${API}/api/projects/${project.id}/shots/${item.id}/speech/generate`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({request_id:`ui-speech-${project.id}-${item.id}`})});
+        const result=await response.json();
+        if (!response.ok) throw new Error(result.detail?.message||`镜头 ${item.id} 配音提交失败`);
+        runs.push(result.run);
+      }
+      flash(`已提交 ${runs.length} 条真实配音任务`);
+      await Promise.all(runs.map(run=>pollRun(run.id)));
+      await refreshProject();
+    } catch(error) { flash(error instanceof Error?error.message:"配音准备失败"); }
+    setBusy(false);
+  }
+
+  async function assembleFinal() {
+    if (!apiOnline) { flash("演示模式：不会伪造 MP4"); return; }
+    setBusy(true);
+    try {
+      const response=await fetch(`${API}/api/projects/${project.id}/assemble`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({require_audio:true,require_approved_keyframes:true})});
+      const result=await response.json();
+      if (!response.ok) throw new Error(result.detail?.blockers?.join("；")||result.detail||"合成失败");
+      await refreshProject();
+      flash(`成片已生成：${result.artifact.checksum_sha256.slice(0,12)}…`);
+    } catch(error) { flash(error instanceof Error?error.message:"合成失败"); }
+    setBusy(false);
   }
 
   return (
@@ -122,8 +197,8 @@ export default function Studio() {
         {page === "story" && <StoryDesk project={project} />}
         {page === "assets" && <AssetBible project={project} flash={flash} />}
         {page === "storyboard" && <Storyboard project={project} shot={shot} setSelected={setSelected} regenerate={regenerate} approveKeyframe={approveKeyframe} busy={busy} />}
-        {page === "review" && <ReviewDesk project={project} shot={shot} setSelected={setSelected} regenerate={regenerate} />}
-        {page === "delivery" && <Delivery project={project} flash={flash} />}
+        {page === "review" && <ReviewDesk project={project} shot={shot} setSelected={setSelected} regenerate={regenerate} generateKeyframes={generateKeyframes} approveCandidate={approveKeyframe} busy={busy} />}
+        {page === "delivery" && <Delivery project={project} flash={flash} prepareAudio={prepareAudioAndSubtitles} assembleFinal={assembleFinal} busy={busy} />}
         {page === "operations" && <Operations project={project} />}
       </section>
     </main>
@@ -188,9 +263,18 @@ function routeLabel(r?:string) { return r==="portrait_drive"?"肖像 / 口型驱
 function routeCopy(r?:string) { return r==="portrait_drive"?"身份稳定 · 低成本":r==="2.5d_parallax"?"关键帧稳定 · 最低成本":r==="premium_i2v"?"复杂动作 · 人工选择":"轻动作 · 锁定身份"; }
 function ContinuityPanel({shot}:{shot:Shot}) { return <div className="inspector-body continuity-panel"><div className="gate-ok"><ShieldCheck size={22}/><div><b>连续性门禁通过</b><span>4 项硬约束已验证</span></div></div>{[["场景",shot.start_state.location],["时间",shot.start_state.time_of_day],["服装版本",shot.start_state.appearance_version||"—"],["手持道具",shot.start_state.holding.join("、")||"无"]].map(x=><div className="constraint" key={x[0]}><span>{x[0]}</span><b>{x[1]}</b><Check size={14}/></div>)}<div className="preserve"><span>MUST PRESERVE</span><p>identity · outfit · prop_state</p></div></div>; }
 
-function ReviewDesk({project,shot,setSelected,regenerate}:{project:Project;shot:Shot;setSelected:(id:string)=>void;regenerate:()=>void}) {
+function ReviewDesk({project,shot,setSelected,regenerate,generateKeyframes,approveCandidate,busy}:{project:Project;shot:Shot;setSelected:(id:string)=>void;regenerate:()=>void;generateKeyframes:()=>void;approveCandidate:(artifactId?:string)=>void;busy:boolean}) {
   const [candidate,setCandidate]=useState(0);
-  return <div className="page scroll-page"><SectionHead eyebrow="GENERATION & HUMAN REVIEW" title="生成与审核台" copy="先选对关键帧，再为昂贵的视频生成买单。"><MockBadge visible compact/><button className="outline-btn"><TimerReset size={16}/> 任务中心</button><button className="primary-btn" onClick={regenerate}><RefreshCw size={15}/> 重试当前镜头</button></SectionHead><div className="review-layout"><div className="review-shots panel"><div className="panel-title"><h3>待审核镜头</h3><span>3</span></div>{project.shots.filter(s=>["repairing","ready","generating"].includes(s.status)).map(s=><button className={s.id===shot.id?"active":""} onClick={()=>setSelected(s.id)} key={s.id}><div className={cn("review-thumb",s.scene_id.includes("alley")?"frame-rain":"frame-corridor")}/><div><b>{s.id.toUpperCase()}</b><span>{s.title}</span><small>{statusText(s.status)}</small></div><ChevronRight size={15}/></button>)}</div><div className="candidate-area panel"><div className="candidate-head"><div><span>{shot.id.toUpperCase()} · MOCK CANDIDATES</span><h2>{shot.title}</h2></div><div className="candidate-switch"><button>A / B 对比</button><button><Grid2X2 size={15}/></button></div></div><div className="candidates">{[0,1,2].map(i=><button onClick={()=>setCandidate(i)} className={cn("candidate",candidate===i&&"selected",i===2&&"frame-rain",i!==2&&"frame-office")} key={i}><span>CANDIDATE {String.fromCharCode(65+i)} · MOCK</span>{candidate===i&&<i><Check size={15}/></i>}<div className="candidate-person"/><small>MOCK RESULT · {i===0?"身份 94 · 构图 88":i===1?"身份 89 · 构图 92":"身份 91 · 构图 84"}</small></button>)}</div><div className="review-actions"><button className="danger-text"><X size={15}/> 全部拒绝</button><div><button className="outline-btn"><RefreshCw size={15}/> 再生成一组</button><button className="primary-btn"><Check size={15}/> 选择候选 {String.fromCharCode(65+candidate)}</button></div></div></div></div><div className="generation-queue panel"><PanelTitle title="异步生成队列" extra="Mock Provider · Demo progress"/><div className="queue-row"><div className="queue-icon"><Film size={17}/></div><div><b>SHOT 05 · 标准 I2V</b><span>MOCK PROGRESS · 生成视频帧 68 / 120</span><div className="progress"><i style={{width:"57%"}}/></div></div><strong>57%</strong><button><Pause size={14}/></button></div><div className="queue-row"><div className="queue-icon teal"><ImageIcon size={17}/></div><div><b>SHOT 07 · 关键帧候选</b><span>MOCK QUEUE · 幂等键已保存</span><div className="progress"><i style={{width:"8%"}}/></div></div><strong>排队</strong><button><X size={14}/></button></div></div></div>;
+  const realCandidates=realArtifactsForShot(project,shot.id,"keyframe");
+  const activeRuns=project.generation_runs.filter(run=>!["completed","failed","cancelled"].includes(run.status));
+  const selected=realCandidates[candidate];
+  useEffect(()=>setCandidate(0),[shot.id,realCandidates.length]);
+  return <div className="page scroll-page"><SectionHead eyebrow="GENERATION & HUMAN REVIEW" title="生成与审核台" copy="先选对真实关键帧，再为昂贵的视频生成买单。"><MockBadge visible={!realCandidates.length} compact/><button className="outline-btn"><TimerReset size={16}/> 任务中心</button><button className="primary-btn" onClick={generateKeyframes} disabled={busy}><ImageIcon size={15}/> 生成 3 个关键帧</button></SectionHead>
+    <div className="review-layout"><div className="review-shots panel"><div className="panel-title"><h3>待审核镜头</h3><span>{project.shots.filter(s=>s.status!=="completed").length}</span></div>{project.shots.filter(s=>s.status!=="completed").map(s=><button className={s.id===shot.id?"active":""} onClick={()=>setSelected(s.id)} key={s.id}><div className={cn("review-thumb",s.scene_id.includes("alley")?"frame-rain":"frame-corridor")}/><div><b>{s.id.toUpperCase()}</b><span>{s.title}</span><small>{statusText(s.status)}</small></div><ChevronRight size={15}/></button>)}</div>
+    <div className="candidate-area panel"><div className="candidate-head"><div><span>{shot.id.toUpperCase()} · {realCandidates.length?"REAL ARTIFACTS":"MOCK CANDIDATES"}</span><h2>{shot.title}</h2></div><div className="candidate-switch"><button>A / B 对比</button><button><Grid2X2 size={15}/></button></div></div>
+    <div className="candidates">{(realCandidates.length?realCandidates:[null,null,null]).map((artifact:MediaArtifact|null,i)=><button onClick={()=>setCandidate(i)} style={artifact?{backgroundImage:`linear-gradient(180deg,transparent 55%,rgba(8,10,14,.85)),url(${API}/api/projects/${project.id}/artifacts/${artifact.id}/content)`,backgroundSize:"cover",backgroundPosition:"center"}:undefined} className={cn("candidate",candidate===i&&"selected",!artifact&&i===2&&"frame-rain",!artifact&&i!==2&&"frame-office")} key={artifact?.id||i}><span>CANDIDATE {String.fromCharCode(65+i)} · {artifact?artifact.source.toUpperCase():"MOCK"}</span>{candidate===i&&<i><Check size={15}/></i>}{!artifact&&<div className="candidate-person"/>}<small>{artifact?`${artifact.provider||"UPLOAD"} · ${Math.round(artifact.file_size/1024)} KB · ${artifact.review_status}`:`MOCK RESULT · ${i===0?"身份 94 · 构图 88":i===1?"身份 89 · 构图 92":"身份 91 · 构图 84"}`}</small></button>)}</div>
+    <div className="review-actions"><button className="danger-text"><X size={15}/> 全部拒绝</button><div><button className="outline-btn" onClick={generateKeyframes} disabled={busy}><RefreshCw size={15}/> 再生成一组</button><button className="primary-btn" disabled={!selected||busy} onClick={()=>selected&&approveCandidate(selected.id)}><Check size={15}/> {selected?.review_status==="approved"?"已批准":"选择真实候选"}</button><button className="outline-btn" disabled={!selected||busy} onClick={regenerate}><Film size={15}/> 从关键帧生成视频</button></div></div></div></div>
+    <div className="generation-queue panel"><PanelTitle title="异步生成队列" extra={activeRuns.length?`${activeRuns.length} 个真实任务`:"当前无活动任务"}/>{activeRuns.length?activeRuns.map(run=><div className="queue-row" key={run.id}><div className="queue-icon"><Film size={17}/></div><div><b>{run.shot_id.toUpperCase()} · {(run.media_kind||"video").toUpperCase()}</b><span>{run.provider} · {run.lifecycle_status||run.status}</span><div className="progress"><i style={{width:`${run.progress||8}%`}}/></div></div><strong>{run.progress?`${run.progress}%`:run.status}</strong></div>):<div className="agent-note"><ShieldCheck size={15}/><span>真实任务完成后，产物会落盘并记录 SHA-256；Mock 不会进入此列表。</span></div>}</div></div>;
 }
 
 function Operations({project}:{project:Project}) {
@@ -210,9 +294,10 @@ function Operations({project}:{project:Project}) {
   </div>;
 }
 
-function Delivery({project,flash}:{project:Project;flash:(s:string)=>void}) {
+function Delivery({project,flash,prepareAudio,assembleFinal,busy}:{project:Project;flash:(s:string)=>void;prepareAudio:()=>void;assembleFinal:()=>void;busy:boolean}) {
   const qa=project.qa_reports[project.qa_reports.length-1];
   const qualityMock=project.data_mode==="demo"||!qa;
+  const finalArtifact=latestFinalArtifact(project);
   const metrics=qa?.metrics||{identity:.91,prompt_alignment:.84,temporal_stability:.78,motion:.76,aesthetics:.86};
   async function backendAction(action:"quality-run"|"export") {
     try {
@@ -222,5 +307,5 @@ function Delivery({project,flash}:{project:Project;flash:(s:string)=>void}) {
       flash(action==="quality-run" ? `质检完成：${result.status}，实测 ${result.measured?.length||0} 个镜头` : "已生成导出清单；没有真实媒体时不会伪造 MP4");
     } catch { flash("API 不可用：未执行真实操作"); }
   }
-  return <div className="page scroll-page"><SectionHead eyebrow="QUALITY GATE & DELIVERY" title="质量与交付台" copy="硬门禁、软评分和每一次修复都有据可查。"><MockBadge visible={qualityMock} compact/><button className="outline-btn" onClick={()=>backendAction("quality-run")}><Activity size={16}/> 运行全片质检</button><button className="primary-btn" onClick={()=>backendAction("export")}><Download size={16}/> 导出成片</button></SectionHead><div className="quality-hero"><div className="score-ring" style={{"--score":`${qa?.score||82}` } as React.CSSProperties}><div><strong>{qa?.score||82}</strong><span>{qualityMock?"Mock 综合分":"综合质量分"}</span></div></div><div className="quality-summary"><span className="passed"><ShieldCheck size={15}/> {qualityMock?"演示门禁结果":"硬门禁通过"}</span><h2>整体质量良好，1 个镜头建议修复</h2><p>{qualityMock&&"DEMO DATA："}角色身份与构图保持稳定；SHOT 06 在黑场转场中检测到时序闪烁，已生成定向修复方案。</p><div className="quality-bars">{Object.entries(metrics).map(([k,v])=><div key={k}><span>{({identity:"身份一致",prompt_alignment:"动作对齐",temporal_stability:"时序稳定",motion:"运动合理",aesthetics:"构图美学"} as Record<string,string>)[k]}<b>{Math.round(v*100)}</b></span><div><i style={{width:`${v*100}%`}}/></div></div>)}</div></div><div className="delivery-card"><span>DELIVERY PRESET</span><h3>竖屏漫剧 · 高清</h3><div><span>画面<b>1080 × 1920</b></span><span>帧率<b>24 FPS</b></span><span>时长<b>50 秒</b></span><span>编码<b>H.264 / AAC</b></span></div><button className="primary-btn" onClick={()=>backendAction("export")}><Download size={16}/> 生成导出清单</button></div></div><div className="two-column quality-columns"><div className="panel"><PanelTitle title="失败与修复记录" extra="Demo 2 条"/><div className="repair-log"><div><i className="warning"><Zap size={15}/></i><div><span>SHOT 06 · FLICKER · MOCK RESULT</span><b>时序闪烁严重</b><p>策略：缩短镜头、降低动作幅度，并切换为 2.5D 路线。</p><small>自动修复 1/2 · 等待复检</small></div><button>查看对比</button></div><div><i className="success"><Check size={15}/></i><div><span>SHOT 03 · IDENTITY DRIFT · MOCK RESULT</span><b>角色身份漂移 · 已解决</b><p>提高主参考图权重，重新生成关键帧后通过。</p><small>Mock：修复前 68 → 修复后 83</small></div><button>查看记录</button></div></div></div><div className="panel"><PanelTitle title="成本追溯" extra="Demo 预算 ¥8.00"/><div className="cost-total"><div><small>本集累计</small><strong>{money(project.cost_events.reduce((a,c)=>a+c.amount,0))}</strong></div><span>预算使用 15%</span></div><div className="cost-bars">{[["关键帧",.16,"#ff7058"],["肖像驱动",.36,"#4cc9c0"],["视频生成",.72,"#f1bc5b"],["语音 / 合成",.08,"#8194ff"]].map(x=><div key={x[0] as string}><span>{x[0]}<b>{money(x[1] as number)}</b></span><div><i style={{width:`${(x[1] as number)/.72*100}%`,background:x[2] as string}}/></div></div>)}</div></div></div></div>;
+  return <div className="page scroll-page"><SectionHead eyebrow="QUALITY GATE & DELIVERY" title="质量与交付台" copy="硬门禁、真实音轨、字幕和最终 MP4 都必须有据可查。"><MockBadge visible={qualityMock&&!finalArtifact} compact/><button className="outline-btn" onClick={()=>backendAction("quality-run")}><Activity size={16}/> 运行全片质检</button><button className="outline-btn" onClick={prepareAudio} disabled={busy}><AudioLines size={16}/> 生成配音与字幕</button><button className="primary-btn" onClick={assembleFinal} disabled={busy}><Film size={16}/> 合成真实 MP4</button></SectionHead><div className="quality-hero"><div className="score-ring" style={{"--score":`${qa?.score||82}` } as React.CSSProperties}><div><strong>{qa?.score||82}</strong><span>{qualityMock?"Mock 综合分":"综合质量分"}</span></div></div><div className="quality-summary"><span className="passed"><ShieldCheck size={15}/> {qualityMock?"演示门禁结果":"硬门禁通过"}</span><h2>{finalArtifact?"真实成片已通过媒体门禁":"等待真实媒体闭环"}</h2><p>{qualityMock&&!finalArtifact&&"DEMO DATA："}{finalArtifact?`最终文件 SHA-256：${finalArtifact.checksum_sha256}`:"请先完成关键帧、视频和配音，再调用 FFmpeg 合成。缺失任何真实轨道时接口都会阻断。"}</p><div className="quality-bars">{Object.entries(metrics).map(([k,v])=><div key={k}><span>{({identity:"身份一致",prompt_alignment:"动作对齐",temporal_stability:"时序稳定",motion:"运动合理",aesthetics:"构图美学"} as Record<string,string>)[k]}<b>{Math.round(v*100)}</b></span><div><i style={{width:`${v*100}%`}}/></div></div>)}</div></div><div className="delivery-card"><span>DELIVERY PRESET</span><h3>竖屏漫剧 · 高清</h3><div><span>画面<b>1080 × 1920</b></span><span>帧率<b>24 FPS</b></span><span>音轨<b>AAC 48kHz</b></span><span>字幕<b>mov_text</b></span></div>{finalArtifact?<a className="primary-btn" href={`${API}/api/projects/${project.id}/artifacts/${finalArtifact.id}/content`}><Download size={16}/> 下载真实成片</a>:<button className="primary-btn" onClick={assembleFinal} disabled={busy}><Film size={16}/> 合成前置检查</button>}</div></div><div className="two-column quality-columns"><div className="panel"><PanelTitle title="真实产物状态" extra={`${(project.media_artifacts||[]).length} 项`}/><div className="repair-log">{(["keyframe","video","audio","subtitle","final_video"] as const).map(kind=><div key={kind}><i className={(project.media_artifacts||[]).some(item=>item.kind===kind)?"success":"warning"}>{(project.media_artifacts||[]).some(item=>item.kind===kind)?<Check size={15}/>:<Clock3 size={15}/>}</i><div><span>{kind.toUpperCase()}</span><b>{(project.media_artifacts||[]).filter(item=>item.kind===kind).length} 个已落盘产物</b><p>{(project.media_artifacts||[]).some(item=>item.kind===kind)?"包含来源、大小和 SHA-256":"尚未完成，不能进入真实交付"}</p></div></div>)}</div></div><div className="panel"><PanelTitle title="成本追溯" extra={`预算 ${money(project.budget_limit||8)}`}/><div className="cost-total"><div><small>本集累计</small><strong>{money(project.cost_events.reduce((a,c)=>a+c.amount,0))}</strong></div><span>仅记录 Provider 回传成本</span></div><div className="cost-bars">{[["关键帧",project.cost_events.filter(c=>c.category==="keyframe").reduce((a,c)=>a+c.amount,0),"#ff7058"],["视频生成",project.cost_events.filter(c=>c.category==="video").reduce((a,c)=>a+c.amount,0),"#f1bc5b"],["语音",project.cost_events.filter(c=>c.category==="audio").reduce((a,c)=>a+c.amount,0),"#8194ff"]].map(x=><div key={x[0] as string}><span>{x[0]}<b>{money(x[1] as number)}</b></span><div><i style={{width:`${Math.min(100,(x[1] as number)/(project.budget_limit||8)*100)}%`,background:x[2] as string}}/></div></div>)}</div></div></div></div>;
 }
