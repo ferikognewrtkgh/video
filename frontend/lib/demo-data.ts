@@ -3,7 +3,7 @@ import { Project } from "./types";
 const state = (location: string, emotion: string, holding: string[] = [], time_of_day = "day", appearance_version = "linxia_office_v1") => ({ location, emotion, holding, time_of_day, appearance_version });
 
 export const demoProject: Project = {
-  id: "project_afterimage", name: "余像 / AFTERIMAGE", source_text: "一名记者收到失踪证人的匿名来信，并在旧报社发现被掩埋三年的真相。", logline: "失踪三年的证人突然归来，一名调查记者必须在雨夜追杀开始前交出真相。", style: "电影感青年漫画 · 暖灰与冷青 · 雨夜霓虹", aspect_ratio: "9:16", target_duration_sec: 50, workflow_status: "running", workflow_step: 7, episode_title: "EP.01 雨停之前",
+  id: "project_afterimage", data_mode: "demo", name: "余像 / AFTERIMAGE", source_text: "一名记者收到失踪证人的匿名来信，并在旧报社发现被掩埋三年的真相。", logline: "失踪三年的证人突然归来，一名调查记者必须在雨夜追杀开始前交出真相。", style: "电影感青年漫画 · 暖灰与冷青 · 雨夜霓虹", aspect_ratio: "9:16", target_duration_sec: 50, workflow_status: "running", workflow_step: 7, episode_title: "EP.01 雨停之前",
   characters: [
     { id: "char_linxia", name: "林夏", role: "调查记者", identity: "26岁，乌黑及肩发，琥珀色眼睛，左眼下有一颗小痣", voice: "冷静、清晰、略带疲惫", locked: true, accent_color: "#ff7058", appearances: [
       { id: "linxia_office_v1", name: "办公室装", outfit: "象牙白衬衫、墨黑长裙、银色腕表", palette: ["#eee8dc", "#242226", "#b9bbc2"], locked: true, prompt_fragment: "ivory shirt, long black skirt, silver watch" },
@@ -35,4 +35,3 @@ export const demoProject: Project = {
   qa_reports: [{ id: "qa_06", shot_id: "shot_06", hard_gate_passed: true, score: 72, metrics: { identity: .94, prompt_alignment: .78, temporal_stability: .52, motion: .61, aesthetics: .82 }, failures: ["flicker"], repair_strategy: "缩短镜头并降低动作幅度，切换 2.5D 路线", attempt: 1, needs_human_review: false }],
   cost_events: [{ amount: .08, category: "keyframe" }, { amount: .08, category: "keyframe" }, { amount: .18, category: "portrait" }, { amount: .18, category: "portrait" }, { amount: .72, category: "video" }]
 };
-

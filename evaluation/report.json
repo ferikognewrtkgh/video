@@ -1,0 +1,8 @@
+{
+  "cases": 20,
+  "route_accuracy": 1.0,
+  "continuity_exact_match": 1.0,
+  "issue_precision": 1.0,
+  "issue_recall": 1.0,
+  "failures": []
+}

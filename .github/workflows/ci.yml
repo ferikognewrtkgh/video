@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: python -m pip install -r backend/requirements.txt
+      - name: Unit, HTTP, media, recovery and provider tests
+        working-directory: backend
+        run: python -m pytest --cov=app --cov-config=../.coveragerc --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=70
+      - name: Executable 20-shot evaluation
+        run: python -m evaluation.run_evaluation --output evaluation/report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-verification
+          path: |
+            backend/coverage.xml
+            evaluation/report.json
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - working-directory: frontend
+        run: npm ci
+      - working-directory: frontend
+        run: npm test
+      - working-directory: frontend
+        run: npm run typecheck
+      - working-directory: frontend
+        run: npm run build

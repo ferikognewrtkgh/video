@@ -1,7 +1,7 @@
 from .domain import (
     Approval, Character, CharacterAppearanceVersion, ContinuityState, CostEvent,
     Event, GenerationRun, GenerationStatus, MetricScores, Project, QAReport, Scene,
-    ShotSpec, WorkflowStatus,
+    ShotSpec, TaskLifecycleStatus, WorkflowStatus,
 )
 
 
@@ -58,7 +58,7 @@ def build_demo_project() -> Project:
         Event(id="evt_03", title="雨夜交付", summary="陈述交出存储卡，追踪者随即出现", tension=94, character_ids=["char_linxia", "char_chenshu"]),
     ]
     runs = [
-        GenerationRun(id=f"run_0{i}", shot_id=f"shot_0{i}", provider="mock", provider_task_id=f"mock_demo_0{i}", idempotency_key=f"demo_key_0{i}", status=GenerationStatus.completed, progress=100, cost=cost, elapsed_sec=9+i, output_uri=f"mock://renders/shot_0{i}.mp4", recipe_id=f"recipe_shot_0{i}")
+        GenerationRun(id=f"run_0{i}", shot_id=f"shot_0{i}", provider="mock", provider_task_id=f"mock_demo_0{i}", idempotency_key=f"demo_key_0{i}", status=GenerationStatus.completed, lifecycle_status=TaskLifecycleStatus.succeeded, progress=100, cost=cost, elapsed_sec=9+i, output_uri=f"mock://renders/shot_0{i}.mp4", recipe_id=f"recipe_shot_0{i}")
         for i, cost in enumerate([0.08, 0.08, 0.18, 0.18], start=1)
     ]
     qa = [

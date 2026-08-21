@@ -2,10 +2,16 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+.test-tmp/
+.pytest-*/
 *.pyc
 node_modules/
 .next/
+.next-build/
+.next-stale-*/
 dist/
 data/checkpoints/*.json
 !data/checkpoints/.gitkeep
-
